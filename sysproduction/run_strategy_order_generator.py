@@ -8,17 +8,14 @@ FIX ME: At the moment it will only run once
 
 """
 
-from sysexecution.strategy_order_handling import orderHandlerAcrossStrategies
+from sysexecution.strategies.strategy_order_handling import orderHandlerAcrossStrategies
 
 from syslogdiag.log import logToMongod as logger
 from sysdata.mongodb.mongo_connection import mongoDb
 from sysproduction.data.get_data import dataBlob
 
 def run_strategy_order_generator():
-    with mongoDb() as mongo_db, \
-            logger("run_strategy_order_generator", mongo_db=mongo_db) as log:
-
-        data = dataBlob(mongo_db=mongo_db, log=log)
+    with dataBlob(log_name="Run-Strategy-Order-Generator") as data:
 
         # FIX ME CODE TO RUN MULTIPLE TIMES
         # FOR NOW JUST RUN ONCE A DAY

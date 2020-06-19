@@ -2,12 +2,15 @@ import datetime
 import pandas as pd
 import re
 
-from ib_insync import Forex, Future, util
-from sysdata.fx.spotfx import currencyValue
+from collections import namedtuple
 
+from ib_insync import Forex, Future, util
+from ib_insync.order import MarketOrder
+
+from sysdata.fx.spotfx import currencyValue
 from sysbrokers.baseClient import brokerClient
 from syscore.genutils import NOT_REQUIRED
-from syscore.objects import missing_contract, arg_not_supplied
+from syscore.objects import missing_contract, arg_not_supplied, missing_order
 from syscore.dateutils import adjust_timestamp
 from syslogdiag.log import logtoscreen
 
@@ -32,8 +35,52 @@ class ibClient(brokerClient):
         ## means our first call won't be throttled for pacing
         self.last_historic_price_calltime = datetime.datetime.now()-  datetime.timedelta(seconds=_PACING_PERIOD_SECONDS)
 
+
+    def broker_get_orders(self):
+        """
+        Get all trades, orders and return them with the information needed
+
+        :return: list
+        """
+        trades_in_broker_format = self.ib.trades()
+
+        return trades_in_broker_format
+
     # Methods in parent class overriden here
     # These methods should abstract the broker completely
+    def broker_submit_single_leg_order(self, contract_object_with_ib_data, trade, account,
+                                                  order_type = "market",
+                                                  limit_price = None):
+        """
+
+        :param ibcontract: contract_object_with_ib_broker_config: contract where instrument has ib metadata
+        :param trade: int
+        :param account: str
+        :param order_type: str, market or limit
+        :param limit_price: None or float
+
+        :return: brokers trade object
+
+        """
+
+        if order_type=="market":
+            raw_trade_object = self.ib_submit_single_leg_market_order(contract_object_with_ib_data, trade, account)
+        else:
+            self.log.critical("Order type %s is not supported for order on %s" % (order_type, str(contract_object_with_ib_data)))
+            return missing_order
+
+        return raw_trade_object
+
+    def broker_get_positions(self):
+        ## Get all the positions
+        ## We return these as a dict of pd DataFrame
+        ## dict entries are asset classes, columns are IB symbol, contract ID, contract expiry
+
+        raw_positions = self.ib.positions()
+        dict_of_positions = from_ib_positions_to_dict(raw_positions)
+
+        return dict_of_positions
+
     def broker_get_futures_contract_list(self, instrument_object_with_ib_config):
 
         specific_log = self.log.setup(instrument_code = instrument_object_with_ib_config.instrument_code)
@@ -156,9 +203,32 @@ class ibClient(brokerClient):
         return expiry_date
 
 
-
     # IB specific methods
     # Called by parent class generics
+
+    def ib_modify_existing_order(self, modified_order_object, original_contract_object):
+        new_trade_object = self.ib.placeOrder(original_contract_object, modified_order_object)
+
+        return new_trade_object
+
+    def ib_cancel_order(self, original_order_object):
+        new_trade_object = self.ib.cancelOrder(original_order_object)
+
+        return new_trade_object
+
+    def ib_submit_single_leg_market_order(self, contract_object_with_ib_data, trade, account=""):
+        ibcontract = self.ib_futures_contract(contract_object_with_ib_data)
+        if ibcontract is missing_contract:
+            return missing_order
+
+        ib_BS_str, ib_qty = resolveBS(trade)
+        ib_order = MarketOrder(ib_BS_str, ib_qty)
+        if account!='':
+            ib_order.account = account
+
+        trade = self.ib.placeOrder(ibcontract, ib_order)
+
+        return trade
 
     def _get_generic_data_for_contract(self, ibcontract, log=None, bar_freq="D", whatToShow='TRADES'):
         """
@@ -413,9 +483,9 @@ def _unique_list_from_total(account_summary_data, tag_name):
 
 def get_barsize_and_duration_from_frequency(bar_freq):
 
-    barsize_lookup = dict([('D', "1 day"), ('H', "1 hour"), ('5M', '5 mins'), ('M', '1 min'),
+    barsize_lookup = dict([('D', "1 day"), ('H', "1 hour"), ('15M', '15 mins'), ('5M', '5 mins'), ('M', '1 min'),
                            ('10S', '10 secs'), ('S', '1 secs')])
-    duration_lookup = dict([('D', "1 Y"), ('H', "1 M"), ('5M', "1 W"), ('M', '1 D'),
+    duration_lookup = dict([('D', "1 Y"), ('H', "1 M"), ('15M', '1 W'), ('5M', "1 W"), ('M', '1 D'),
                             ('10S', '14400 S'), ('S', '1800 S')])
     try:
         assert bar_freq in barsize_lookup.keys() and bar_freq in duration_lookup.keys()
@@ -513,4 +583,47 @@ def ib_timestamp_to_datetime(timestamp_ib):
     adjusted_ts = adjust_timestamp(timestamp)
 
     return adjusted_ts
+
+def from_ib_positions_to_dict(raw_positions):
+    """
+
+    :param raw_positions: list of positions in form Position(...)
+    :return: dict of positions as dataframes
+    """
+    resolved_positions_dict = dict()
+    position_methods = dict(STK = resolve_ib_stock_position, FUT = resolve_ib_future_position,
+                            CASH = resolve_ib_cash_position)
+    for position in raw_positions:
+        asset_class = position.contract.secType
+        method = position_methods.get(asset_class, None)
+        if method is None:
+            raise Exception("Can't find asset class %s in methods dict" % asset_class)
+
+        resolved_position = method(position)
+        asset_class_list = resolved_positions_dict.get(asset_class, [])
+        asset_class_list.append(resolved_position)
+        resolved_positions_dict[asset_class] = asset_class_list
+
+    return resolved_positions_dict
+
+def resolve_ib_stock_position(position):
+    return dict(account = position.account, symbol = position.contract.symbol,
+                multiplier = 1.0, expiry = "",
+                exchange = position.contract.exchange, currency = position.contract.currency,
+                position = position.position)
+
+def resolve_ib_future_position(position):
+    return dict(account = position.account, symbol = position.contract.symbol, expiry = position.contract.lastTradeDateOrContractMonth,
+                multiplier = float(position.contract.multiplier), currency = position.contract.currency,
+                position = position.position)
+
+def resolve_ib_cash_position(position):
+    return dict(account = position.account, symbol = position.contract.localSymbol,
+                expiry = "", multiplier = 1.0,
+                currency = position.contract.currency, position = position.position)
+
+def resolveBS(trade):
+    if trade<0:
+        return 'SELL', abs(trade)
+    return 'BUY', abs(trade)
 
